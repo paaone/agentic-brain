@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# local data (DB lives at ~/.agentic-brain/ by default; only matters if user picks per-repo)
+data/
+*.db
+*.db-wal
+*.db-shm
+
+.pytest_cache/
+.coverage
+.DS_Store

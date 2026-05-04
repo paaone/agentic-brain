@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentic-brain"
+version = "0.1.0"
+description = "Local semantic memory for Claude Code, GitHub Copilot, and other dev tools"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+minilm = ["sentence-transformers>=2.2"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+agentic-brain = "memory.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["memory*"]
