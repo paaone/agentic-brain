@@ -6,7 +6,6 @@ All errors logged to /tmp/agentic-brain.log; nothing raises out of run_reflectio
 from __future__ import annotations
 
 import json
-import logging
 import os
 import re
 import shutil
@@ -15,15 +14,18 @@ from pathlib import Path
 
 from . import redact, transcript
 from .embed import get_embedder
-from .store import add_memory, get_offset, init_db, mark_ingested
+from .store import (
+    add_memory,
+    get_logger,
+    get_offset,
+    init_db,
+    last_maintenance_session_count,
+    mark_ingested,
+    session_count,
+)
 
-LOG_PATH = Path(os.environ.get("AGENTIC_BRAIN_LOG", "/tmp/agentic-brain.log"))
-_log = logging.getLogger("agentic-brain.reflector")
-if not _log.handlers:
-    _h = logging.FileHandler(LOG_PATH)
-    _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    _log.addHandler(_h)
-    _log.setLevel(logging.INFO)
+MAINTENANCE_EVERY = int(os.environ.get("AGENTIC_BRAIN_MAINTENANCE_EVERY", "50"))
+_log = get_logger("agentic-brain.reflector")
 
 
 VALID_KINDS = {"writing-style", "code-pattern", "decision", "snippet",
@@ -31,8 +33,15 @@ VALID_KINDS = {"writing-style", "code-pattern", "decision", "snippet",
 
 PROMPT_TEMPLATE = """You are a memory-distillation agent. Read the transcript and extract 0-8 DURABLE items the user will want remembered next session: writing voice/tone rules, recurring code patterns/conventions, named decisions with rationale, reusable snippets, stated preferences, project-specific facts. SKIP: ephemeral debugging, secrets, tokens, file contents the user pasted, anything tied to one bug. Each `content` must be self-contained (no "see above").
 
+Also assign each memory a `confidence` 1-10:
+  10 = lifelong rule the user clearly endorses (e.g. "always X")
+   8 = strong recurring preference, mentioned with conviction
+   5 = reasonable guess from one decision
+   2 = weak signal, might not generalize
+   1 = ephemeral, would only matter for this single bug/task
+
 Return ONLY raw JSON, no prose, no code fence:
-{{"memories":[{{"kind":"writing-style|code-pattern|decision|snippet|preference|domain-fact","title":"<=80 chars","summary":"<=240 chars","content":"<=1500 chars, self-contained","tags":["<=6 tags"]}}]}}
+{{"memories":[{{"kind":"writing-style|code-pattern|decision|snippet|preference|domain-fact","title":"<=80 chars","summary":"<=240 chars","content":"<=1500 chars, self-contained","tags":["<=6 tags"],"confidence":1-10}}]}}
 
 If nothing durable, return {{"memories":[]}}.
 
@@ -106,8 +115,13 @@ def _validate(item: dict) -> dict | None:
         return None
     tags_raw = item.get("tags") or []
     tags = [str(t).strip().lower()[:32] for t in tags_raw if str(t).strip()][:6]
+    try:
+        confidence = int(item.get("confidence", 5))
+    except (TypeError, ValueError):
+        confidence = 5
+    confidence = max(1, min(10, confidence))
     return {"kind": kind, "title": title, "summary": summary,
-            "content": content, "tags": tags}
+            "content": content, "tags": tags, "confidence": confidence}
 
 
 def extract_memories(transcript_text: str) -> list[dict]:
@@ -179,11 +193,31 @@ def run_reflection(session_id: str, cwd: str,
                 content=m["content"], tags=m["tags"],
                 source_session_id=session_id, source_cwd=cwd, source_branch=branch,
                 vector=vec, model=embedder.name,
+                confidence=m.get("confidence", 5),
             )
 
         mark_ingested(session_id, len(turns))
         _log.info("saved %d memories from session %s", len(items), session_id)
+
+        # Auto-maintenance: every Nth session, run purge + skill promotion.
+        try:
+            _maybe_run_maintenance()
+        except Exception as e:  # never fail reflection on a maintenance error
+            _log.exception("auto-maintenance failed: %s", e)
+
         return len(items)
     except Exception as e:  # never propagate from a Stop-hook background job
         _log.exception("run_reflection failed: %s", e)
         return 0
+
+
+def _maybe_run_maintenance() -> None:
+    if MAINTENANCE_EVERY <= 0:
+        return
+    delta = session_count() - last_maintenance_session_count()
+    if delta < MAINTENANCE_EVERY:
+        return
+    _log.info("auto-maintenance triggered (delta=%d)", delta)
+    from .maintenance import run_maintenance
+    summary = run_maintenance(dry_run=False)
+    _log.info("auto-maintenance: %s", summary)

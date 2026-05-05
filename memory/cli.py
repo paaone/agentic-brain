@@ -22,11 +22,16 @@ from .embed import get_embedder
 from .exporters import copilot as copilot_exporter
 from .exporters import cursor as cursor_exporter
 from .reflector import run_reflection
+from . import store
 from .store import (
     Memory,
+    boost,
+    bump_usage,
     claude_rerank_top_k,
+    delete_memory,
     init_db,
     list_memories,
+    set_pinned,
     stats,
     top_k,
 )
@@ -41,15 +46,20 @@ def _format_memory_md(m: Memory) -> str:
 
 
 def _semantic_search(query: str, k: int, kind: str | None,
-                     cwd_prefix: str | None) -> list[Memory]:
+                     cwd_prefix: str | None,
+                     track: bool = True) -> list[Memory]:
     cfg = config.load_config()
     if cfg.embedder == "claude-rerank":
-        return claude_rerank_top_k(query, k=k, kind=kind, cwd_prefix=cwd_prefix)
-    embedder = get_embedder()
-    qv = embedder.encode([query])
-    if qv.shape[0] == 0:
-        return []
-    return top_k(qv[0], k=k, kind=kind, cwd_prefix=cwd_prefix)
+        results = claude_rerank_top_k(query, k=k, kind=kind, cwd_prefix=cwd_prefix)
+    else:
+        embedder = get_embedder()
+        qv = embedder.encode([query])
+        if qv.shape[0] == 0:
+            return []
+        results = top_k(qv[0], k=k, kind=kind, cwd_prefix=cwd_prefix)
+    if track and results:
+        bump_usage([m.id for m in results])
+    return results
 
 
 # ---------- subcommand handlers ----------
@@ -193,6 +203,81 @@ def cmd_rebuild(args: argparse.Namespace) -> int:
         conn.close()
 
 
+def cmd_purge(args: argparse.Namespace) -> int:
+    init_db()
+    from .maintenance import purge
+    summary = purge(threshold=args.threshold, keep_recent=args.keep_recent,
+                    dry_run=args.dry_run)
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
+def cmd_promote_skills(args: argparse.Namespace) -> int:
+    init_db()
+    from .skills import promote
+    summary = promote(dry_run=args.dry_run, min_cluster=args.min_cluster,
+                      min_sessions=args.min_sessions)
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
+def cmd_maintenance(args: argparse.Namespace) -> int:
+    init_db()
+    from .maintenance import run_maintenance
+    summary = run_maintenance(dry_run=args.dry_run)
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
+def cmd_pin(args: argparse.Namespace) -> int:
+    init_db()
+    ok = set_pinned(args.id, True)
+    print(f"pinned {args.id}" if ok else f"no memory with id {args.id}")
+    return 0 if ok else 1
+
+
+def cmd_unpin(args: argparse.Namespace) -> int:
+    init_db()
+    ok = set_pinned(args.id, False)
+    print(f"unpinned {args.id}" if ok else f"no memory with id {args.id}")
+    return 0 if ok else 1
+
+
+def cmd_boost(args: argparse.Namespace) -> int:
+    init_db()
+    ok = boost(args.id, amount=args.by)
+    print(f"boosted {args.id} by {args.by}" if ok
+          else f"no memory with id {args.id}")
+    return 0 if ok else 1
+
+
+def cmd_forget(args: argparse.Namespace) -> int:
+    init_db()
+    ok = delete_memory(args.id)
+    print(f"deleted {args.id}" if ok else f"no memory with id {args.id}")
+    return 0 if ok else 1
+
+
+def cmd_score(args: argparse.Namespace) -> int:
+    init_db()
+    from .maintenance import score_all
+    scored = score_all()
+    hit = next((s for s in scored if s["id"] == args.id), None)
+    if not hit:
+        print(f"no memory with id {args.id}")
+        return 1
+    m = hit["memory"]
+    out = {
+        "id": m.id, "title": m.title, "kind": m.kind,
+        "pinned": m.pinned, "promoted_to_skill": m.promoted_to_skill,
+        "use_count": m.use_count, "confidence": m.confidence,
+        "last_used_at": m.last_used_at, "created_at": m.created_at,
+        "score": hit["score"], "components": hit["components"],
+    }
+    print(json.dumps(out, indent=2))
+    return 0
+
+
 def cmd_export_copilot(args: argparse.Namespace) -> int:
     init_db()
     out = copilot_exporter.export(out_path=args.out, repo=args.repo)
@@ -256,6 +341,48 @@ def build_parser() -> argparse.ArgumentParser:
     pb.add_argument("--embedder", required=True,
                     choices=("minilm", "claude-rerank", "hash-tfidf"))
     pb.set_defaults(func=cmd_rebuild)
+
+    pp_purge = sub.add_parser("purge",
+                              help="Drop low-scoring memories (run periodically)")
+    pp_purge.add_argument("--threshold", type=float, default=0.30,
+                          help="Composite-score floor (default 0.30)")
+    pp_purge.add_argument("--keep-recent", type=int, default=30, dest="keep_recent",
+                          help="Always keep the N newest memories")
+    pp_purge.add_argument("--dry-run", action="store_true", dest="dry_run")
+    pp_purge.set_defaults(func=cmd_purge)
+
+    pp_skills = sub.add_parser("promote-skills",
+                               help="Cluster memories into draft SKILL.md files")
+    pp_skills.add_argument("--dry-run", action="store_true", dest="dry_run")
+    pp_skills.add_argument("--min-cluster", type=int, default=3, dest="min_cluster")
+    pp_skills.add_argument("--min-sessions", type=int, default=2, dest="min_sessions")
+    pp_skills.set_defaults(func=cmd_promote_skills)
+
+    pp_maint = sub.add_parser("maintenance",
+                              help="Run purge + skill promotion together")
+    pp_maint.add_argument("--dry-run", action="store_true", dest="dry_run")
+    pp_maint.set_defaults(func=cmd_maintenance)
+
+    pp_pin = sub.add_parser("pin", help="Pin a memory (never purged)")
+    pp_pin.add_argument("id", type=int)
+    pp_pin.set_defaults(func=cmd_pin)
+
+    pp_unpin = sub.add_parser("unpin", help="Unpin a memory")
+    pp_unpin.add_argument("id", type=int)
+    pp_unpin.set_defaults(func=cmd_unpin)
+
+    pp_boost = sub.add_parser("boost", help="Raise a memory's confidence")
+    pp_boost.add_argument("id", type=int)
+    pp_boost.add_argument("--by", type=int, default=2)
+    pp_boost.set_defaults(func=cmd_boost)
+
+    pp_forget = sub.add_parser("forget", help="Delete a single memory")
+    pp_forget.add_argument("id", type=int)
+    pp_forget.set_defaults(func=cmd_forget)
+
+    pp_score = sub.add_parser("score", help="Show composite score for one memory")
+    pp_score.add_argument("id", type=int)
+    pp_score.set_defaults(func=cmd_score)
 
     pc = sub.add_parser("export-copilot",
                         help="Write .github/copilot-instructions.md")

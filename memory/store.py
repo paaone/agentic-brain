@@ -6,6 +6,7 @@ an in-RAM (N, dim) matrix is faster than any ANN index and has no extra deps.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 from dataclasses import dataclass
@@ -15,6 +16,18 @@ from pathlib import Path
 import numpy as np
 
 from .config import load_config
+
+
+def get_logger(name: str) -> logging.Logger:
+    """Module-level logger writing to AGENTIC_BRAIN_LOG. Safe to call repeatedly."""
+    log = logging.getLogger(name)
+    if not log.handlers:
+        path = Path(os.environ.get("AGENTIC_BRAIN_LOG", "/tmp/agentic-brain.log"))
+        h = logging.FileHandler(path)
+        h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        log.addHandler(h)
+        log.setLevel(logging.INFO)
+    return log
 
 
 @dataclass
@@ -30,6 +43,11 @@ class Memory:
     source_branch: str
     created_at: str
     score: float = 0.0
+    confidence: int = 5
+    last_used_at: str | None = None
+    use_count: int = 0
+    pinned: bool = False
+    promoted_to_skill: str | None = None
 
 
 SCHEMA = """
@@ -43,7 +61,12 @@ CREATE TABLE IF NOT EXISTS memories (
     source_session_id TEXT NOT NULL DEFAULT '',
     source_cwd TEXT NOT NULL DEFAULT '',
     source_branch TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    confidence INTEGER NOT NULL DEFAULT 5,
+    last_used_at TEXT,
+    use_count INTEGER NOT NULL DEFAULT 0,
+    pinned INTEGER NOT NULL DEFAULT 0,
+    promoted_to_skill TEXT
 );
 CREATE TABLE IF NOT EXISTS embeddings (
     memory_id INTEGER PRIMARY KEY,
@@ -57,9 +80,37 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_offset INTEGER NOT NULL DEFAULT 0,
     ingested_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS maintenance_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ran_at TEXT NOT NULL,
+    sessions_at_run INTEGER NOT NULL,
+    purged INTEGER NOT NULL DEFAULT 0,
+    promoted INTEGER NOT NULL DEFAULT 0
+);
+"""
+
+# Indexes created after migration so they can reference newly-added columns.
+_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_memories_kind ON memories(kind);
 CREATE INDEX IF NOT EXISTS idx_memories_cwd ON memories(source_cwd);
+CREATE INDEX IF NOT EXISTS idx_memories_pinned ON memories(pinned);
 """
+
+# Columns added after v0.1; safe to ALTER on existing DBs.
+_MIGRATIONS = [
+    ("ALTER TABLE memories ADD COLUMN confidence INTEGER NOT NULL DEFAULT 5", "confidence"),
+    ("ALTER TABLE memories ADD COLUMN last_used_at TEXT", "last_used_at"),
+    ("ALTER TABLE memories ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0", "use_count"),
+    ("ALTER TABLE memories ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0", "pinned"),
+    ("ALTER TABLE memories ADD COLUMN promoted_to_skill TEXT", "promoted_to_skill"),
+]
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(memories)").fetchall()}
+    for sql, col in _MIGRATIONS:
+        if col not in cols:
+            conn.execute(sql)
 
 
 def _db_path() -> Path:
@@ -79,6 +130,8 @@ def init_db() -> Path:
     conn = _connect()
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
+        conn.executescript(_INDEXES)
         conn.commit()
     finally:
         conn.close()
@@ -87,6 +140,13 @@ def init_db() -> Path:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+_FULL_COLS = (
+    "id, kind, title, summary, content, tags_json, "
+    "source_session_id, source_cwd, source_branch, created_at, "
+    "confidence, last_used_at, use_count, pinned, promoted_to_skill"
+)
 
 
 def add_memory(
@@ -100,16 +160,19 @@ def add_memory(
     source_branch: str,
     vector: np.ndarray,
     model: str,
+    confidence: int = 5,
 ) -> int:
     conn = _connect()
     try:
         cur = conn.execute(
             """INSERT INTO memories
                (kind, title, summary, content, tags_json,
-                source_session_id, source_cwd, source_branch, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                source_session_id, source_cwd, source_branch, created_at,
+                confidence)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (kind, title, summary, content, json.dumps(tags),
-             source_session_id, source_cwd, source_branch, _now()),
+             source_session_id, source_cwd, source_branch, _now(),
+             max(1, min(10, int(confidence)))),
         )
         mid = cur.lastrowid
         vec = np.asarray(vector, dtype=np.float32).reshape(-1)
@@ -129,6 +192,11 @@ def _row_to_memory(row, score: float = 0.0) -> Memory:
         tags=json.loads(row[5] or "[]"),
         source_session_id=row[6], source_cwd=row[7], source_branch=row[8],
         created_at=row[9], score=score,
+        confidence=int(row[10]),
+        last_used_at=row[11],
+        use_count=int(row[12]),
+        pinned=bool(row[13]),
+        promoted_to_skill=row[14],
     )
 
 
@@ -136,9 +204,7 @@ def list_memories(kind: str | None = None, cwd_prefix: str | None = None,
                   limit: int = 100) -> list[Memory]:
     conn = _connect()
     try:
-        sql = ("SELECT id, kind, title, summary, content, tags_json, "
-               "source_session_id, source_cwd, source_branch, created_at "
-               "FROM memories WHERE 1=1")
+        sql = f"SELECT {_FULL_COLS} FROM memories WHERE 1=1"
         args: list = []
         if kind:
             sql += " AND kind = ?"
@@ -154,6 +220,94 @@ def list_memories(kind: str | None = None, cwd_prefix: str | None = None,
         conn.close()
 
 
+def get_memory(memory_id: int) -> Memory | None:
+    conn = _connect()
+    try:
+        row = conn.execute(
+            f"SELECT {_FULL_COLS} FROM memories WHERE id = ?",
+            (memory_id,),
+        ).fetchone()
+        return _row_to_memory(row) if row else None
+    finally:
+        conn.close()
+
+
+def bump_usage(ids: list[int]) -> None:
+    """Record that these memories were just retrieved (recency + use_count)."""
+    if not ids:
+        return
+    conn = _connect()
+    try:
+        placeholders = ",".join("?" * len(ids))
+        conn.execute(
+            f"UPDATE memories SET use_count = use_count + 1, "
+            f"last_used_at = ? WHERE id IN ({placeholders})",
+            [_now(), *ids],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def set_pinned(memory_id: int, pinned: bool) -> bool:
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "UPDATE memories SET pinned = ? WHERE id = ?",
+            (1 if pinned else 0, memory_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def boost(memory_id: int, amount: int = 2) -> bool:
+    """Manually raise a memory's confidence (clamped 1-10)."""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT confidence FROM memories WHERE id = ?", (memory_id,),
+        ).fetchone()
+        if not row:
+            return False
+        new_conf = max(1, min(10, int(row[0]) + amount))
+        conn.execute(
+            "UPDATE memories SET confidence = ? WHERE id = ?",
+            (new_conf, memory_id),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def delete_memory(memory_id: int) -> bool:
+    conn = _connect()
+    try:
+        cur = conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+        conn.execute("DELETE FROM embeddings WHERE memory_id = ?", (memory_id,))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def mark_promoted(ids: list[int], skill_name: str) -> None:
+    if not ids:
+        return
+    conn = _connect()
+    try:
+        placeholders = ",".join("?" * len(ids))
+        conn.execute(
+            f"UPDATE memories SET promoted_to_skill = ? WHERE id IN ({placeholders})",
+            [skill_name, *ids],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def stats() -> dict:
     conn = _connect()
     try:
@@ -162,8 +316,80 @@ def stats() -> dict:
             "SELECT kind, COUNT(*) FROM memories GROUP BY kind").fetchall())
         models = dict(conn.execute(
             "SELECT model, COUNT(*) FROM embeddings GROUP BY model").fetchall())
-        return {"total": total, "by_kind": by_kind, "by_model": models,
-                "db_path": str(_db_path())}
+        sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        pinned = conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE pinned = 1").fetchone()[0]
+        promoted = conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE promoted_to_skill IS NOT NULL"
+        ).fetchone()[0]
+        return {
+            "total": total, "by_kind": by_kind, "by_model": models,
+            "sessions": sessions, "pinned": pinned, "promoted": promoted,
+            "db_path": str(_db_path()),
+        }
+    finally:
+        conn.close()
+
+
+def session_count() -> int:
+    conn = _connect()
+    try:
+        return conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def last_maintenance_session_count() -> int:
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT sessions_at_run FROM maintenance_runs "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return int(row[0]) if row else 0
+    finally:
+        conn.close()
+
+
+def record_maintenance(purged: int, promoted: int) -> None:
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT INTO maintenance_runs (ran_at, sessions_at_run, purged, promoted) "
+            "VALUES (?, ?, ?, ?)",
+            (_now(), session_count(), purged, promoted),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_all_for_scoring() -> tuple[list[Memory], np.ndarray | None]:
+    """Return every memory plus an aligned embedding matrix (or None)."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            f"SELECT {_FULL_COLS} FROM memories ORDER BY id"
+        ).fetchall()
+        memories = [_row_to_memory(r) for r in rows]
+        if not memories:
+            return [], None
+        ids = [m.id for m in memories]
+        placeholders = ",".join("?" * len(ids))
+        emb_rows = conn.execute(
+            f"SELECT memory_id, vector, dim FROM embeddings WHERE memory_id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        by_mid = {r[0]: (np.frombuffer(r[1], dtype=np.float32), r[2]) for r in emb_rows}
+        if not by_mid:
+            return memories, None
+        dim = next(iter(by_mid.values()))[1]
+        matrix = np.zeros((len(memories), dim), dtype=np.float32)
+        for i, m in enumerate(memories):
+            entry = by_mid.get(m.id)
+            if entry and entry[1] == dim:
+                matrix[i] = entry[0]
+        return memories, matrix
     finally:
         conn.close()
 
@@ -229,9 +455,7 @@ def top_k(query_vec: np.ndarray, k: int = 5, kind: str | None = None,
 
         placeholders = ",".join("?" * len(winners))
         rows = conn.execute(
-            "SELECT id, kind, title, summary, content, tags_json, "
-            "source_session_id, source_cwd, source_branch, created_at "
-            f"FROM memories WHERE id IN ({placeholders})",
+            f"SELECT {_FULL_COLS} FROM memories WHERE id IN ({placeholders})",
             [w[0] for w in winners],
         ).fetchall()
         by_id = {r[0]: r for r in rows}
